@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import pulp
+import pydeck as pdk
 import simpy
 import streamlit as st
 
@@ -137,32 +138,82 @@ def solve_facility_location(facilities, customers, dist_matrix, cost_per_unit_di
     return {"status": status, "objective": objective, "opened": opened, "assignment": assignment_df}
 
 
-def make_network_map(facilities, customers, opened, assignment_df):
-    fig = go.Figure()
+def make_network_gis_map(facilities, customers, opened, assignment_df):
+    """Real GIS basemap (deck.gl / pydeck) with flow arcs sized by shipment volume."""
+    fac_lookup = facilities.set_index("facility_id")
+    cust_lookup = customers.set_index("customer_id")
+
+    arcs = []
     if assignment_df is not None and not assignment_df.empty:
-        fac_lookup = facilities.set_index("facility_id")
-        cust_lookup = customers.set_index("customer_id")
+        max_qty = assignment_df["quantity"].max()
         for _, row in assignment_df.iterrows():
             f = fac_lookup.loc[row["facility_id"]]
             c = cust_lookup.loc[row["customer_id"]]
-            fig.add_trace(go.Scattergeo(lon=[c["lon"], f["lon"]], lat=[c["lat"], f["lat"]], mode="lines",
-                                         line=dict(width=1, color="rgba(100,100,255,0.35)"), showlegend=False, hoverinfo="skip"))
-    fig.add_trace(go.Scattergeo(lon=customers["lon"], lat=customers["lat"],
-                                 text=customers["name"] + "<br>demand: " + customers["demand"].astype(str),
-                                 mode="markers", marker=dict(size=8, color="dodgerblue"), name="Customers"))
-    fac_closed = facilities[~facilities["facility_id"].isin(opened)]
-    fac_open = facilities[facilities["facility_id"].isin(opened)]
-    fig.add_trace(go.Scattergeo(lon=fac_closed["lon"], lat=fac_closed["lat"], text=fac_closed["name"] + " (not opened)",
-                                 mode="markers", marker=dict(size=10, color="lightgray", symbol="square", line=dict(width=1, color="gray")),
-                                 name="Candidate (closed)"))
-    fig.add_trace(go.Scattergeo(lon=fac_open["lon"], lat=fac_open["lat"], text=fac_open["name"] + " (OPEN)",
-                                 mode="markers", marker=dict(size=16, color="crimson", symbol="star", line=dict(width=1, color="darkred")),
-                                 name="Opened Facility"))
-    fig.update_layout(geo=dict(scope="world", projection_type="natural earth", showland=True,
-                                landcolor="rgb(240,240,240)", countrycolor="rgb(200,200,200)"),
-                       margin=dict(l=0, r=0, t=0, b=0), height=520,
-                       legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0))
-    return fig
+            arcs.append({
+                "from_lon": f["lon"], "from_lat": f["lat"],
+                "to_lon": c["lon"], "to_lat": c["lat"],
+                "quantity": row["quantity"],
+                "width": 1 + 6 * (row["quantity"] / max_qty) if max_qty else 1,
+                "facility": f["name"], "customer": c["name"],
+                "tooltip": f"{f['name']} → {c['name']}: {row['quantity']:,.0f} units ({row['distance']:.0f} mi)",
+            })
+    arcs_df = pd.DataFrame(arcs)
+
+    fac_open_df = facilities[facilities["facility_id"].isin(opened)].copy()
+    fac_open_df["tooltip"] = fac_open_df["name"] + " (OPEN)"
+    fac_closed_df = facilities[~facilities["facility_id"].isin(opened)].copy()
+    fac_closed_df["tooltip"] = fac_closed_df["name"] + " (candidate, not opened)"
+    cust_df = customers.copy()
+    cust_df["tooltip"] = cust_df["name"] + " — demand: " + cust_df["demand"].astype(str)
+
+    layers = []
+    if not arcs_df.empty:
+        layers.append(pdk.Layer(
+            "ArcLayer", arcs_df,
+            get_source_position=["from_lon", "from_lat"],
+            get_target_position=["to_lon", "to_lat"],
+            get_source_color=[220, 20, 60, 160],
+            get_target_color=[65, 105, 225, 160],
+            get_width="width",
+            pickable=True,
+            auto_highlight=True,
+        ))
+    layers.append(pdk.Layer(
+        "ScatterplotLayer", cust_df,
+        get_position=["lon", "lat"],
+        get_fill_color=[65, 105, 225, 180],
+        get_radius=25000,
+        pickable=True,
+    ))
+    if not fac_closed_df.empty:
+        layers.append(pdk.Layer(
+            "ScatterplotLayer", fac_closed_df,
+            get_position=["lon", "lat"],
+            get_fill_color=[160, 160, 160, 180],
+            get_radius=35000,
+            pickable=True,
+        ))
+    if not fac_open_df.empty:
+        layers.append(pdk.Layer(
+            "ScatterplotLayer", fac_open_df,
+            get_position=["lon", "lat"],
+            get_fill_color=[220, 20, 60, 220],
+            get_radius=55000,
+            pickable=True,
+        ))
+
+    all_lats = pd.concat([facilities["lat"], customers["lat"]])
+    all_lons = pd.concat([facilities["lon"], customers["lon"]])
+    view_state = pdk.ViewState(
+        latitude=float(all_lats.mean()), longitude=float(all_lons.mean()),
+        zoom=3, pitch=30,
+    )
+
+    return pdk.Deck(
+        layers=layers, initial_view_state=view_state,
+        map_style="road",
+        tooltip={"text": "{tooltip}"},
+    )
 
 
 # ==========================================================================================
@@ -232,39 +283,77 @@ def weighted_kmeans_greenfield(points, k, max_iter=50, seed=42):
     return pd.DataFrame(results), assignments
 
 
-def make_cog_map(points, centers_df, assignments=None):
-    fig = go.Figure()
-    colors = ["crimson", "darkorange", "seagreen", "royalblue", "purple", "brown", "teal", "magenta"]
+_CLUSTER_COLORS = [
+    [220, 20, 60], [255, 140, 0], [46, 139, 87], [65, 105, 225],
+    [128, 0, 128], [139, 69, 19], [0, 128, 128], [199, 21, 133],
+]
+
+
+def make_cog_gis_map(points, centers_df, assignments=None):
+    """Real GIS basemap (deck.gl / pydeck) showing customer-to-new-facility flow arcs."""
+    points = points.reset_index(drop=True)
+    arcs = []
+    cust_rows = []
+
     if assignments is not None and len(centers_df) > 1:
         for c_idx in range(len(centers_df)):
             mask = assignments == c_idx
             cluster_pts = points[mask]
-            color = colors[c_idx % len(colors)]
+            color = _CLUSTER_COLORS[c_idx % len(_CLUSTER_COLORS)]
             center = centers_df.iloc[c_idx]
             for _, row in cluster_pts.iterrows():
-                fig.add_trace(go.Scattergeo(lon=[row["lon"], center["lon"]], lat=[row["lat"], center["lat"]],
-                                             mode="lines", line=dict(width=1, color=color), opacity=0.35,
-                                             showlegend=False, hoverinfo="skip"))
-            fig.add_trace(go.Scattergeo(lon=cluster_pts["lon"], lat=cluster_pts["lat"],
-                                         text=cluster_pts["name"] + "<br>demand: " + cluster_pts["demand"].astype(str),
-                                         mode="markers", marker=dict(size=8, color=color), name=f"Customers → {center['facility']}"))
+                arcs.append({
+                    "from_lon": row["lon"], "from_lat": row["lat"],
+                    "to_lon": center["lon"], "to_lat": center["lat"],
+                    "width": 1 + 5 * (row["demand"] / points["demand"].max()),
+                    "color": color,
+                    "tooltip": f"{row['name']} → {center['facility']}: demand {row['demand']:,.0f}",
+                })
+                cust_rows.append({**row.to_dict(), "color": color, "tooltip": f"{row['name']} — demand {row['demand']:,.0f}"})
     else:
         center = centers_df.iloc[0]
+        color = _CLUSTER_COLORS[0]
         for _, row in points.iterrows():
-            fig.add_trace(go.Scattergeo(lon=[row["lon"], center["lon"]], lat=[row["lat"], center["lat"]], mode="lines",
-                                         line=dict(width=1, color="rgba(100,100,255,0.35)"), showlegend=False, hoverinfo="skip"))
-        fig.add_trace(go.Scattergeo(lon=points["lon"], lat=points["lat"],
-                                     text=points["name"] + "<br>demand: " + points["demand"].astype(str),
-                                     mode="markers", marker=dict(size=8, color="dodgerblue"), name="Customers"))
-    fig.add_trace(go.Scattergeo(lon=centers_df["lon"], lat=centers_df["lat"], text=centers_df["facility"],
-                                 mode="markers+text", textposition="top center",
-                                 marker=dict(size=18, color="gold", symbol="star", line=dict(width=2, color="black")),
-                                 name="Optimal Location(s)"))
-    fig.update_layout(geo=dict(scope="world", projection_type="natural earth", showland=True,
-                                landcolor="rgb(240,240,240)", countrycolor="rgb(200,200,200)"),
-                       margin=dict(l=0, r=0, t=0, b=0), height=520,
-                       legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0))
-    return fig
+            arcs.append({
+                "from_lon": row["lon"], "from_lat": row["lat"],
+                "to_lon": center["lon"], "to_lat": center["lat"],
+                "width": 1 + 5 * (row["demand"] / points["demand"].max()),
+                "color": color,
+                "tooltip": f"{row['name']} → {center['facility']}: demand {row['demand']:,.0f}",
+            })
+            cust_rows.append({**row.to_dict(), "color": color, "tooltip": f"{row['name']} — demand {row['demand']:,.0f}"})
+
+    arcs_df = pd.DataFrame(arcs)
+    cust_df = pd.DataFrame(cust_rows)
+    centers_plot = centers_df.copy()
+    centers_plot["tooltip"] = centers_plot["facility"] + " (recommended new site)"
+
+    layers = [
+        pdk.Layer(
+            "ArcLayer", arcs_df,
+            get_source_position=["from_lon", "from_lat"],
+            get_target_position=["to_lon", "to_lat"],
+            get_source_color="color", get_target_color="color",
+            get_width="width", pickable=True, auto_highlight=True,
+        ),
+        pdk.Layer(
+            "ScatterplotLayer", cust_df,
+            get_position=["lon", "lat"], get_fill_color="color",
+            get_radius=25000, pickable=True, opacity=0.7,
+        ),
+        pdk.Layer(
+            "ScatterplotLayer", centers_plot,
+            get_position=["lon", "lat"], get_fill_color=[255, 215, 0, 230],
+            get_radius=50000, pickable=True,
+            stroked=True, get_line_color=[0, 0, 0], line_width_min_pixels=2,
+        ),
+    ]
+
+    all_lats = pd.concat([points["lat"], centers_df["lat"]])
+    all_lons = pd.concat([points["lon"], centers_df["lon"]])
+    view_state = pdk.ViewState(latitude=float(all_lats.mean()), longitude=float(all_lons.mean()), zoom=3, pitch=30)
+
+    return pdk.Deck(layers=layers, initial_view_state=view_state, map_style="road", tooltip={"text": "{tooltip}"})
 
 
 # ==========================================================================================
@@ -460,8 +549,9 @@ def page_network():
                 m3.metric("Baseline Cost", f"${baseline['objective']:,.0f}")
                 m4.metric("Annual Savings", f"${savings:,.0f}")
 
-            st.subheader("🗺️ Network Map")
-            st.plotly_chart(make_network_map(facilities, customers, optimized["opened"], optimized["assignment"]), use_container_width=True)
+            st.subheader("🗺️ Network Map — Flows from Open Facilities to Customers")
+            st.caption("Line thickness = shipment volume. Red dots = opened facilities, gray = closed candidates, blue = customers. Hover for details.")
+            st.pydeck_chart(make_network_gis_map(facilities, customers, optimized["opened"], optimized["assignment"]), use_container_width=True)
 
             col_a, col_b = st.columns(2)
             with col_a:
@@ -562,8 +652,9 @@ def page_greenfield():
             savings = base_cost_dollars - total_cost
             m3.metric("Annual Savings vs. Current Site", f"${savings:,.0f}")
 
-        st.subheader("🗺️ Optimal Location(s)")
-        st.plotly_chart(make_cog_map(customers, centers_df, assignments), use_container_width=True)
+        st.subheader("🗺️ Optimal Location(s) — Flows from Customers")
+        st.caption("Line thickness = demand volume. Gold dots = recommended new facility site(s). Hover for details.")
+        st.pydeck_chart(make_cog_gis_map(customers, centers_df, assignments), use_container_width=True)
 
         st.subheader("📍 Recommended Locations")
         display_df = centers_df.copy()
